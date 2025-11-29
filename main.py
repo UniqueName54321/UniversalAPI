@@ -1,8 +1,13 @@
 import flask
 import ai
 
-RANDOM_MODEL = "meta-llama/llama-3.2-3b-instruct:free"  # or whatever cheap/fast model you like
-MAIN_MODEL   = "x-ai/grok-4.1-fast:free"               # for serious pages
+RANDOM_MODEL = "meta-llama/llama-3.2-3b-instruct:free"   # or whatever cheap/fast model you like
+MAIN_MODEL   = "x-ai/grok-4.1-fast:free"                 # for serious pages
+
+AI_PERSONALITY = """
+You are friendly, helpful, a little humorous, and you keep explanations simple.
+Avoid being overly formal. Be clear, human-like, and engaging.
+"""
 
 BASE_PROMPT = """You are a universal content generator. Your job is to create a response document that matches the topic, meaning, or purpose of the following URL path:
 
@@ -176,27 +181,80 @@ NO commentary outside the body
 No “Here is your response” phrasing  
 """
 
+# --------- CACHED SYSTEM MESSAGE (BUILT ONCE AT IMPORT) ---------
+SYSTEM_MESSAGE = {
+    "role": "system",
+    "content": AI_PERSONALITY + "\n\n" + BASE_PROMPT,
+}
 
-AI_PERSONALITY = """
-You are friendly, helpful, a little humorous, and you keep explanations simple.
-Avoid being overly formal. Be clear, human-like, and engaging.
-"""
-
-cache = {}
-
-def generate_request_body(url_path: str, model: str, optional_data: str = "", mood_instruction: str = "") -> str:
-    full_prompt = (
-    AI_PERSONALITY
-    + mood_instruction
-    + "\n\n"
-    + BASE_PROMPT
-        .replace("{{URL_PATH}}", url_path)
-        .replace("{{OPTIONAL_DATA}}", optional_data)
-    )
-
-    return ai.generate_text_response(full_prompt, model)
+cache: dict[str, tuple[str, str]] = {}
 
 app = flask.Flask(__name__)
+
+
+def get_max_tokens_for_path(url_path: str) -> int:
+    """
+    Rough heuristic for max_tokens based on the URL path.
+    Tune this however you like.
+    """
+    p = url_path.lower()
+
+    # Tiny text-ish or config-like
+    if p in ("robots.txt", "sitemap.xml", "readme.md"):
+        return 512
+
+    # API / data paths – usually small structured JSON/XML
+    if p.startswith(("api/", "data/", "json/")) or p.endswith((".json", ".xml", ".txt")):
+        return 1024
+
+    # Question-style or long-slug explanation
+    if "why-" in p or "how-" in p or "-" in p:
+        return 2048
+
+    # Default: full HTML-ish page with sections
+    return 4096
+
+
+def generate_request_body(
+    url_path: str,
+    model: str,
+    optional_data: str = "",
+    mood_instruction: str = "",
+    max_tokens: int = 2048,
+) -> str:
+    """
+    Build a user-level prompt that works with the cached SYSTEM_MESSAGE.
+
+    The system message holds all the rules.
+    This user message just feeds:
+      - URL_PATH
+      - MOOD_OVERRIDE
+      - OPTIONAL_DATA
+    """
+
+    mood_instruction = (mood_instruction or "").strip()
+    if mood_instruction:
+        mood_line = f"MOOD_OVERRIDE: {mood_instruction}"
+    else:
+        mood_line = "MOOD_OVERRIDE: (none)"
+
+    user_prompt = (
+        f"URL_PATH: {url_path}\n"
+        f"{mood_line}\n\n"
+        f"OPTIONAL_DATA:\n{optional_data or '(none)'}\n"
+    )
+
+    messages = [
+        SYSTEM_MESSAGE,                     # cached rules
+        {"role": "user", "content": user_prompt},
+    ]
+
+    return ai.generate_text_response(
+        messages=messages,
+        model=model,
+        max_tokens=max_tokens,
+    )
+
 
 @app.route("/")
 def home():
@@ -269,20 +327,21 @@ def home():
 """
     return flask.Response(html, content_type="text/html; charset=utf-8")
 
+
 @app.route("/random")
 def random_page():
     # Generate fake path target for AI
     fake_path = "!!GENERATE_RANDOM_TOPIC!!"
 
-    optional_data = ""
-    mood = flask.request.args.get("mood", "")
-    query = flask.request.query_string.decode()
+    mood = flask.request.args.get("mood", "").strip()
+    optional_data = ""  # you could feed query/body later if you want
 
-    # Build request body normally (AI will detect the special token)
     response_body = generate_request_body(
         fake_path,
         model=RANDOM_MODEL,
-        optional_data=optional_data
+        optional_data=optional_data,
+        mood_instruction=mood,
+        max_tokens=3072,   # give it room for a fun page
     )
 
     # Extract MIME and body
@@ -296,31 +355,30 @@ def random_page():
     return flask.Response(body, content_type=content_type)
 
 
-
 @app.route('/<path:url_path>', methods=['GET', 'POST'])
 def handle_request(url_path):
     query = flask.request.query_string.decode()
     cache_key = url_path + "?" + query
 
+    # Serve from cache for GETs
     if cache_key in cache and flask.request.method == 'GET':
         content_type, body = cache[cache_key]
         return flask.Response(body, content_type=content_type)
 
     mood = flask.request.args.get("mood", "").strip()
-    if mood:
-        mood_override = f"Personality override: {mood}"
-    else:
-        mood_override = ""
 
     optional_data = ""
     if flask.request.method == 'POST':
         optional_data = f"Additional Data:\n{flask.request.get_data(as_text=True)}\n"
 
+    max_tokens = get_max_tokens_for_path(url_path)
+
     response_body = generate_request_body(
         url_path,
         model=MAIN_MODEL,
         optional_data=optional_data,
-        mood_instruction=mood_override,
+        mood_instruction=mood,
+        max_tokens=max_tokens,
     )
 
     raw_first_line, _, rest = response_body.partition("\n")
@@ -343,12 +401,12 @@ def handle_request(url_path):
 
     resp = flask.Response(body, content_type=content_type)
 
+    # Cache GET responses
     if flask.request.method == 'GET':
         cache[cache_key] = (content_type, body)
 
-
-
     return resp
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

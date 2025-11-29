@@ -1,5 +1,4 @@
 import openai
-import textwrap
 
 or_api_key = ""
 with open(".openrouter_api_key", "r") as f:
@@ -10,6 +9,7 @@ client = openai.OpenAI(
     api_key=or_api_key
 )
 
+
 def _preview(text: str, limit: int = 400) -> str:
     """Return a shortened one-line preview of text for logging."""
     text = text.replace("\n", "\\n")
@@ -17,25 +17,42 @@ def _preview(text: str, limit: int = 400) -> str:
         return text[:limit] + "... [truncated]"
     return text
 
-def generate_text_response(prompt: str, model: str) -> str:
+
+def generate_text_response(
+    messages: list[dict],
+    model: str,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+) -> str:
+    """
+    Call an OpenRouter chat model with a flexible messages list.
+
+    messages example:
+    [
+        {"role": "system", "content": "...rules..."},
+        {"role": "user", "content": "...per-request prompt..."},
+    ]
+    """
+
     # --- pre-call debug info ---
     print("\n[AI] --------------------------------------------------")
     print(f"[AI] Calling model: {model}")
-    print(f"[AI] max_tokens: 16384, temperature: 0.7")
-    print(f"[AI] Prompt preview:\n[AI]   { _preview(prompt) }")
+    print(f"[AI] max_tokens: {max_tokens}, temperature: {temperature}")
+
+    # Try to preview the last user message (most relevant to debug)
+    user_contents = [m.get("content", "") for m in messages if m.get("role") == "user"]
+    last_user_content = user_contents[-1] if user_contents else ""
+    print(f"[AI] Prompt preview (last user message):\n[AI]   { _preview(last_user_content) }")
     print("[AI] Sending request to OpenRouter...")
 
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=16384,  # more than enough for most usecases
-            temperature=0.7,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
     except Exception as e:
-        # log the error and re-raise so Flask still surfaces it
         print(f"[AI] ERROR while calling model {model}: {e}")
         raise
 
