@@ -179,3 +179,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# OpenRouter API key file
+# yeah no i'm not leaking my api key :P
+.openrouter_api_key
