@@ -1,7 +1,7 @@
 import flask
 import ai
 
-RANDOM_MODEL = "meta-llama/llama-3.2-3b-instruct:free"   # or whatever cheap/fast model you like
+RANDOM_MODEL = "meituan/longcat-flash-chat:free"   # or whatever cheap/fast model you like
 MAIN_MODEL   = "x-ai/grok-4.1-fast:free"                 # for serious pages
 
 AI_PERSONALITY = """
@@ -149,6 +149,14 @@ If the URL_PATH (or the provided path) is "!!GENERATE_RANDOM_TOPIC!!", you MUST:
 
 6. Apply personality and mood override normally.
 
+SPECIAL RULE FOR RANDOM TOPICS:
+When URL_PATH is "!!GENERATE_RANDOM_TOPIC!!":
+
+- The topic is entirely fictional.
+- You MUST NOT include an "External Links" section.
+- DO NOT attempt to create hypothetical or placeholder real-world URLs.
+- Internal links ("Related Pages", "Explore More") are still required.
+
 -------------------------------------------------------------------------------
 JSON RULES (when MIME = application/json)
 -------------------------------------------------------------------------------
@@ -169,6 +177,52 @@ OPTIONAL DATA (POST requests)
 -------------------------------------------------------------------------------
 
 If {{OPTIONAL_DATA}} contains POST data, incorporate it meaningfully into the response content without breaking the required output structure.
+
+------------------------------------------------------------------------------
+TERMS OF SERVICE AND OTHER LEGALITIES
+-------------------------------------------------------------------------------
+
+SPECIAL LEGAL PAGE RULES
+-------------------------------------------------------------------------------
+
+If the URL_PATH includes terms such as "terms", "policy", "legal", 
+"privacy", or "conditions":
+
+- DO NOT use humor unless explicitly instructed via MOOD_OVERRIDE.
+- Tone must be formal, clear, and legally appropriate.
+- Do not include jokes, casual phrasing, or conversational fluff.
+- Focus on clarity, correctness, and structure.
+
+-------------------------------------------------------------------------------
+EXTERNAL LINKS RULES
+-------------------------------------------------------------------------------
+
+If the URL_PATH clearly refers to a real-world topic, product, brand, media
+franchise, game, book, comic, company, person, technology, or any subject 
+that exists outside this site:
+
+1. Include a section titled "External Links" AFTER "Related Pages" but BEFORE
+   "Explore More".
+
+2. External links MUST be real URLs relevant to the topic. Examples:
+   - Official websites
+   - Wikipedia
+   - Fandom/Wikia pages
+   - Author/artist pages
+   - Official social media
+   - GitHub repos (if software-related)
+   - Documentation pages
+   - Stores or archives hosting the real media
+
+3. Only include **2–4** highly relevant external links.
+
+4. DO NOT hallucinate URLs. Use the most well-known existing ones.
+
+5. If the topic is fictional and has no real-world references, do NOT create an
+   External Links section.
+
+6. Internal navigation (Related Pages, Explore More) MUST still use internal
+   site paths.
 
 -------------------------------------------------------------------------------
 OUTPUT SUMMARY
