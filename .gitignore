@@ -187,3 +187,5 @@ cython_debug/
 # Page memory file
 # Not useful to track page memory in git, and might leak sensitive info anyway so uhh :3
 page_memory.json
+*.json
+page_memory.json
