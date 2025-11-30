@@ -244,7 +244,13 @@ that exists outside this site:
 OUTPUT SUMMARY
 -------------------------------------------------------------------------------
 
-FIRST LINE: strictly the MIME type ONLY  
+First line MUST be either:
+MIME_TYPE (e.g. text/html), or
+STATUS_CODE MIME_TYPE (e.g. 201 application/json).
+
+If you don’t care about status codes, use 200 by default.
+Never use 404.
+
 FOLLOWING LINES: the content body  
 NO code fences  
 NO commentary outside the body  

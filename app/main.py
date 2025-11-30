@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, Response, RedirectResponse, StreamingResponse
 
 from .config import MAIN_MODEL, RANDOM_MODEL
-from .generator import generate_page_for_path, get_max_tokens_for_path, stream_page_for_path
+from .generator import generate_page_for_path, get_max_tokens_for_path, stream_page_for_path, parse_status_and_mime
 from .memory import remember_page, get_related_memory
 
 app = FastAPI()
@@ -91,7 +91,7 @@ async def random_page(mood: str | None = None):
     """
     Stream a random fictional topic page.
     """
-    media_type, body_stream = await stream_page_for_path(
+    status_code, media_type, body_stream = await stream_page_for_path(
         url_path="!!GENERATE_RANDOM_TOPIC!!",
         model=RANDOM_MODEL,
         optional_data="",
@@ -99,12 +99,12 @@ async def random_page(mood: str | None = None):
         max_tokens=3072,
     )
 
-    # No memory for /random per your original rule
     async def passthrough():
         async for chunk in body_stream:
             yield chunk
 
-    return StreamingResponse(passthrough(), media_type=media_type)
+    return StreamingResponse(passthrough(), media_type=media_type, status_code=status_code)
+
 
 @app.get("/edit/{url_path:path}", response_class=HTMLResponse)
 async def edit_page_get(url_path: str) -> HTMLResponse:
@@ -180,13 +180,7 @@ async def edit_page_post(url_path: str, instructions: str = Form("")):
 
     # Parse first line for media type, then body
     raw_first, _, rest = response_body.partition("\n")
-    media_type = raw_first.strip()
-    if media_type.lower().startswith("content-type"):
-        media_type = media_type.split(":", 1)[-1].strip()
-    if "/" not in media_type:
-        media_type = "text/plain"
-    if "charset" not in media_type.lower():
-        media_type = f"{media_type}; charset=utf-8"
+    status_code, media_type = parse_status_and_mime(raw_first)
     full_body = rest.strip()
 
     normalized_path = "/" + url_path if not url_path.startswith("/") else url_path
@@ -234,7 +228,7 @@ async def handle_request(url_path: str, request: Request, mood: str | None = Non
     max_tokens = get_max_tokens_for_path(url_path)
 
     # ----- STREAM FROM MODEL -----
-    media_type, body_stream = await stream_page_for_path(
+    status_code, media_type, body_stream = await stream_page_for_path(
         url_path=url_path,
         model=MAIN_MODEL,
         optional_data=optional_data,
@@ -242,24 +236,22 @@ async def handle_request(url_path: str, request: Request, mood: str | None = Non
         max_tokens=max_tokens,
     )
 
-    # ----- RULE: DO NOT STREAM JSON OR XML -----
-    if media_type.startswith("application/json") or media_type.endswith("json") \
-       or media_type.endswith("xml") or media_type.startswith("text/xml") \
-       or "xml" in media_type:
 
-        # Fully consume the stream
+    # ----- RULE: DO NOT STREAM JSON OR XML -----
+    if media_type.startswith("application/json") or media_type.endswith("json") or media_type.endswith("xml") or media_type.startswith("text/xml") or "xml" in media_type:
+
         parts = []
         async for chunk in body_stream:
             parts.append(chunk)
         full_body = "".join(parts)
 
-        # async memory save
         asyncio.create_task(remember_page(normalized_path, full_body, media_type))
 
         if request.method == "GET":
             cache[cache_key] = (media_type, full_body)
 
-        return Response(full_body, media_type=media_type)
+        return Response(full_body, media_type=media_type, status_code=status_code)
+
 
     # ----- OTHERWISE: STREAM LIKE A GIGACHAD -----
     async def tee():
@@ -275,7 +267,8 @@ async def handle_request(url_path: str, request: Request, mood: str | None = Non
         if request.method == "GET":
             cache[cache_key] = (media_type, full_body)
 
-    return StreamingResponse(tee(), media_type=media_type)
+    return StreamingResponse(tee(), media_type=media_type, status_code=status_code)
+
 
 if __name__ == "__main__":
     import uvicorn
