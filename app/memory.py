@@ -6,7 +6,7 @@ import threading
 import hashlib
 from typing import List, Dict, Tuple
 
-from .config import MEMORY_FILE, RANDOM_MODEL
+from .config import MEMORY_FILE_STR as MEMORY_FILE, RANDOM_MODEL
 from .ai_client import generate_text_response
 
 # Thread lock is fine here; we only use it around dict/file ops.
@@ -34,6 +34,16 @@ def _load_memory() -> None:
         else:
             page_memory = {}
     except Exception:
+        page_memory = {}
+
+def clear_page_memory() -> None:
+    """
+    Completely clear the in-memory page_memory dictionary.
+    Does NOT touch the disk file directly.
+    Intended for use by reset endpoints before any new writes happen.
+    """
+    global page_memory
+    with memory_lock:
         page_memory = {}
 
 

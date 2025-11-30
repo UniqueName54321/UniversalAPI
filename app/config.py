@@ -1,4 +1,9 @@
-RANDOM_MODEL = "meituan/longcat-flash-chat:free"   # cheap/fast model
-MAIN_MODEL = "x-ai/grok-4.1-fast:free"             # main page model
+# MODELS
+MAIN_MODEL = "x-ai/grok-4.1-fast:free"
+RANDOM_MODEL = "meituan/longcat-flash-chat:free"
+IMAGE_GEN_MODEL = "google/gemini-2.5-flash-image"  # or whatever OpenRouter exposes
 
-MEMORY_FILE = ".page_memory.json"
+# PATHS
+IMAGE_CACHE_DIR_STR = "./.image_cache" # i'm not made of money you know
+MEMORY_FILE_STR = ".page_memory.json"
+OPENROUTER_KEY_FILE_STR = ".openrouter_api_key"

@@ -1,8 +1,12 @@
 # app/generator.py
 import asyncio
+import re
 from typing import AsyncIterator, Tuple
-from .prompts import SYSTEM_MESSAGE
-from .ai_client import generate_text_response, stream_text_response
+
+from .config import RANDOM_MODEL, IMAGE_GEN_MODEL
+
+from .prompts import IMAGE_PROMPT_SYSTEM, SYSTEM_MESSAGE
+from .ai_client import generate_image, generate_text_response, stream_text_response
 
 def get_max_tokens_for_path(url_path: str) -> int:
     p = url_path.lower().strip()
@@ -161,3 +165,135 @@ async def stream_page_for_path(
         await asyncio.sleep(0)
 
     return status_holder["status"], mime_holder["mime"], body_iter()
+
+def _path_to_image_concept(url_path: str) -> str:
+    """
+    Convert something like '/stories/space-wizard.png' -> 'space wizard'
+    or '/dragon/holding-latte.png' -> 'dragon holding latte'
+    """
+    # strip leading slash and extension
+    path = url_path.lstrip("/")
+    if path.lower().endswith(".png"):
+        path = path[:-4]
+
+    # take last segment as main topic
+    segment = path.split("/")[-1]
+    segment = segment.replace("-", " ").replace("_", " ")
+    segment = re.sub(r"\s+", " ", segment).strip()
+    return segment or "abstract scene"
+
+
+async def generate_png_for_path(
+    url_path: str,
+    optional_data: str,
+    mood_instruction: str | None = None,
+) -> tuple[bytes, int]:
+    """
+    Returns (image_bytes, status_code).
+    Status 200 on success, 500 or 400-ish on failure.
+    """
+
+    concept = _path_to_image_concept(url_path)
+
+    # You can get fancy and let optional_data influence the prompt
+    # e.g. SITE_MEMORY: previous pages, POST_DATA, etc.
+    # For now we just use it lightly.
+    base_prompt = (
+        f"High quality illustration of: {concept}. "
+        "Crisp details, visually appealing, centered composition."
+    )
+
+    if mood_instruction:
+        base_prompt += f" Style mood: {mood_instruction}."
+
+    # If SITE_MEMORY contains something juicy about this path, you could parse it
+    # from optional_data, but that's extra credit.
+
+    try:
+        image_bytes = await generate_image(
+            prompt=base_prompt,
+            model=IMAGE_GEN_MODEL,
+        )
+        if not image_bytes:
+            return b"", 500
+        return image_bytes, 200
+    except Exception as e:
+        # log error somewhere if you want
+        print(f"[IMAGE] Error generating PNG for {url_path}: {e}")
+        return b"", 500
+    
+
+async def build_image_prompt_for_path(
+    url_path: str,
+    optional_data: str,
+    mood_instruction: str | None = None,
+) -> str:
+    """
+    Use RANDOM_MODEL to turn the raw path + site memory into a proper image prompt.
+    """
+
+    # We'll give the model enough context to be smart, but keep it cheap.
+    mood_line = mood_instruction.strip() if mood_instruction else "(none)"
+
+    user_content = (
+        f"URL_PATH: {url_path}\n"
+        f"MOOD: {mood_line}\n\n"
+        f"SITE_CONTEXT:\n{optional_data}"
+    )
+
+    messages = [
+        {"role": "system", "content": IMAGE_PROMPT_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Keep this cheap + deterministic-ish
+    prompt = await generate_text_response(
+        messages=messages,
+        model=RANDOM_MODEL,
+        max_tokens=128,
+        temperature=0.2,
+    )
+
+    return prompt.strip()
+
+
+async def generate_png_for_path(
+    url_path: str,
+    optional_data: str,
+    mood_instruction: str | None = None,
+) -> tuple[bytes, int]:
+    """
+    1) Use RANDOM_MODEL to infer the best image prompt.
+    2) Use IMAGE_GEN_MODEL to generate the PNG bytes.
+    3) Return (bytes, status_code).
+    """
+
+    print("[DEBUG] Using IMAGE_GEN_MODEL:", IMAGE_GEN_MODEL)
+
+
+    try:
+        image_prompt = await build_image_prompt_for_path(
+            url_path=url_path,
+            optional_data=optional_data,
+            mood_instruction=mood_instruction,
+        )
+
+        if not image_prompt:
+            print(f"[IMAGE] Empty prompt for {url_path}")
+            return b"", 500
+
+        # Call your image model via ai_client
+        img_bytes = await generate_image(
+            prompt=image_prompt,
+            model=IMAGE_GEN_MODEL,
+        )
+
+        if not img_bytes:
+            print(f"[IMAGE] No bytes returned for {url_path}")
+            return b"", 500
+
+        return img_bytes, 200
+
+    except Exception as e:
+        print(f"[IMAGE] Error generating PNG for {url_path}: {e}")
+        return b"", 500

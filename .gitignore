@@ -160,3 +160,6 @@ cython_debug/
 
 # --- PAGE MEMORY (THIS FILE KNOWS TOO MUCH) ---
 .page_memory.json
+
+# ---- IMAGE CACHE (SIMILAR REASON) ---
+.image_cache/

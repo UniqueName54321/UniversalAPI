@@ -1,9 +1,12 @@
 # app/ai_client.py
-import asyncio
+import base64
 from openai import AsyncOpenAI
+from .config import OPENROUTER_KEY_FILE_STR
+
+import httpx
 
 or_api_key = ""
-with open(".openrouter_api_key", "r") as f:
+with open(OPENROUTER_KEY_FILE_STR, "r") as f:
     or_api_key = f.read().strip()
 
 client = AsyncOpenAI(
@@ -54,3 +57,62 @@ async def stream_text_response(messages: list[dict], model: str, max_tokens: int
         except Exception:
             # ignore non-token events (e.g., role, tool, etc.)
             continue
+
+
+async def generate_image(prompt: str, model: str) -> bytes:
+    """
+    Generate an image via OpenRouter using the chat/completions endpoint.
+
+    Returns raw image bytes (PNG or whatever the model outputs).
+    Raises RuntimeError on failure.
+    """
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {or_api_key}",
+        "Content-Type": "application/json",
+        # Optional but nice for attribution on OpenRouter dashboards:
+        # "HTTP-Referer": "https://github.com/<your-username>/UniversalAPI",
+        # "X-Title": "UniversalAPI",
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "modalities": ["image", "text"],
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
+
+    if r.status_code != 200:
+        # Let yourself see the full error body while debugging
+        raise RuntimeError(
+            f"OpenRouter image API error {r.status_code}: {r.text}"
+        )
+
+    result = r.json()
+
+    choices = result.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"No choices in OpenRouter image response: {result}")
+
+    message = choices[0].get("message") or {}
+    images = message.get("images") or []
+    if not images:
+        raise RuntimeError(f"No images field in image response: {result}")
+
+    # OpenRouter returns base64 data URLs like "data:image/png;base64,AAAA..."
+    data_url = images[0]["image_url"]["url"]
+    if not data_url.startswith("data:image"):
+        raise RuntimeError(f"Unexpected image_url format: {data_url[:80]}...")
+
+    _, b64_data = data_url.split(",", 1)
+    return base64.b64decode(b64_data)
