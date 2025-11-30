@@ -1,8 +1,14 @@
 import flask
 import ai
+import json
+import os
+import re
+import time
+import threading
+import hashlib
 
 RANDOM_MODEL = "meituan/longcat-flash-chat:free"   # or whatever cheap/fast model you like
-MAIN_MODEL   = "x-ai/grok-4.1-fast:free"                 # for serious pages
+MAIN_MODEL   = "x-ai/grok-4.1-fast:free"           # for serious pages
 
 AI_PERSONALITY = """
 You are friendly, helpful, a little humorous, and you keep explanations simple.
@@ -98,6 +104,12 @@ When producing HTML:
           font-weight: 600;
         }
         .section { margin-top: 2rem; }
+        .edit-link {
+          font-size: 0.9rem;
+          color: #777;
+          display: inline-block;
+          margin-top: 1rem;
+        }
       </style>
     </head>
     <body>...</body>
@@ -116,6 +128,10 @@ When producing HTML:
 
 - For homepage-like pages ("/", "/index", "/index.html"):
     → Generate a clean homepage layout with welcome text, sections, and useful guidance.
+
+- For HTML pages, include a small "Edit this page" link somewhere near the top or bottom,
+  pointing to "/edit{{URL_PATH}}".
+  Example: <a href="/edit/nebula" class="edit-link">Edit this page</a>
 
 - Avoid unnecessary verbosity.
 
@@ -173,10 +189,20 @@ MARKDOWN RULES (when MIME = text/markdown)
 - Heading hierarchy MUST be consistent.
 
 -------------------------------------------------------------------------------
-OPTIONAL DATA (POST requests)
+OPTIONAL DATA (POST requests and site memory)
 -------------------------------------------------------------------------------
 
-If {{OPTIONAL_DATA}} contains POST data, incorporate it meaningfully into the response content without breaking the required output structure.
+OPTIONAL_DATA may contain:
+
+- POST_DATA: raw data from POST requests.
+- SITE_MEMORY: summaries of other related pages on this site.
+- EDIT_INSTRUCTIONS: user instructions for how to revise or reshape the page.
+
+You MUST:
+- Use SITE_MEMORY to keep information consistent across related pages.
+- Respect EDIT_INSTRUCTIONS when present, while still obeying URL_PATH rules.
+- Incorporate POST_DATA meaningfully when provided.
+- Never break the required output format.
 
 ------------------------------------------------------------------------------
 TERMS OF SERVICE AND OTHER LEGALITIES
@@ -243,6 +269,190 @@ SYSTEM_MESSAGE = {
 
 cache: dict[str, tuple[str, str]] = {}
 
+# --------- SIMPLE PAGE MEMORY (WITH LLM SUMMARIES) -------------
+MEMORY_FILE = "page_memory.json"
+memory_lock = threading.Lock()
+
+# page_memory structure:
+# {
+#   "/path": {
+#       "summary": str,
+#       "links": ["/other", "/paths"],
+#       "last_updated": float_timestamp,
+#       "hash": str  # hash of body content to avoid re-summarizing unchanged pages
+#   },
+#   ...
+# }
+try:
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            page_memory: dict[str, dict] = json.load(f)
+    else:
+        page_memory = {}
+except Exception:
+    page_memory = {}
+
+
+def _extract_internal_links_from_html(html: str) -> list[str]:
+    """
+    Very simple href extractor for internal links like href="/something".
+    Not a full HTML parser, but good enough for our use.
+    """
+    hrefs = re.findall(r'href="(/[^"#?"]*)"', html)
+    seen = set()
+    result = []
+    for h in hrefs:
+        if h not in seen:
+            seen.add(h)
+            result.append(h)
+    return result
+
+
+def summarize_page_with_ai(body: str, max_chars: int = 6000) -> str:
+    """
+    Use the RANDOM_MODEL to generate a concise summary of a page's body.
+    Output should be plain text, a few sentences, no markdown or extra metadata.
+    """
+    text = body.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars]
+
+    if not text:
+        return ""
+
+    system_msg = (
+        "You are a concise summarization engine.\n"
+        "Your job is to read page content and produce a short, clear summary "
+        "(2–5 sentences). Return only the summary as plain text. "
+        "Do not include headings, bullet points, or labels. No markdown."
+    )
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {
+            "role": "user",
+            "content": (
+                "Summarize the following page content for later site-wide reference:\n\n"
+                f"{text}"
+            ),
+        },
+    ]
+
+    try:
+        summary = ai.generate_text_response(
+            messages=messages,
+            model=RANDOM_MODEL,
+            max_tokens=256,
+            temperature=0.3,
+        )
+        return summary.strip()
+    except Exception as e:
+        print(f"[MEMORY] Summarization error: {e}")
+        # Fallback: crude snippet
+        snippet = text[:800]
+        if len(text) > 800:
+            snippet += " ..."
+        return snippet
+
+
+def remember_page(url_path: str, body: str, content_type: str):
+    """
+    Store a summarized memory + internal links for this page.
+    Uses LLM-based summarization (RANDOM_MODEL) and caches by content hash.
+    """
+    ct_lower = content_type.lower()
+
+    # Only store text-ish content
+    if not (ct_lower.startswith("text/") or ct_lower.startswith("application/json")):
+        return
+
+    # Compute content hash so we don't re-summarize unchanged pages
+    try:
+        body_hash = hashlib.sha256(body.encode("utf-8", "ignore")).hexdigest()
+    except Exception:
+        body_hash = ""
+
+    links: list[str] = []
+    if ct_lower.startswith("text/html"):
+        links = _extract_internal_links_from_html(body)
+
+    with memory_lock:
+        old_entry = page_memory.get(url_path)
+        need_summary = True
+        summary = ""
+
+        if old_entry and old_entry.get("hash") == body_hash and old_entry.get("summary"):
+            # Content seems unchanged; reuse summary
+            summary = old_entry.get("summary", "")
+            need_summary = False
+
+        if need_summary:
+            summary = summarize_page_with_ai(body)
+
+        page_memory[url_path] = {
+            "summary": summary,
+            "links": links,
+            "last_updated": time.time(),
+            "hash": body_hash,
+        }
+
+        try:
+            with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(page_memory, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[MEMORY] Failed to write {MEMORY_FILE}: {e}")
+
+
+def get_related_memory(url_path: str, limit: int = 5) -> list[tuple[str, dict]]:
+    """
+    Super simple relatedness:
+    - Shared tokens in the path (split on / and -)
+    - Backlink style: pages that link to this one
+    """
+    with memory_lock:
+        if not page_memory:
+            return []
+
+        tokens = set(
+            t for t in re.split(r"[/\-]+", url_path.lower())
+            if t and t not in {"api", "data", "json"}
+        )
+
+        scores: list[tuple[float, str]] = []
+
+        # Precompute backlinks
+        backlinks: dict[str, int] = {}
+        for path, entry in page_memory.items():
+            for link in entry.get("links", []):
+                backlinks[link] = backlinks.get(link, 0) + 1
+
+        for path, entry in page_memory.items():
+            if path == "/" or path == url_path:
+                continue
+
+            other_tokens = set(
+                t for t in re.split(r"[/\-]+", path.lower())
+                if t
+            )
+            token_score = len(tokens & other_tokens)
+
+            backlink_score = 0.0
+            # If this page is linked from others, give a small boost
+            if url_path in backlinks:
+                backlink_score = float(backlinks.get(url_path, 0))
+
+            score = token_score + 0.5 * backlink_score
+            if score > 0:
+                scores.append((score, path))
+
+        scores.sort(key=lambda x: x[0], reverse=True)
+
+        results: list[tuple[str, dict]] = []
+        for _, path in scores[:limit]:
+            results.append((path, page_memory[path]))
+        return results
+
+
 app = flask.Flask(__name__)
 
 
@@ -307,6 +517,7 @@ def generate_request_body(
         messages=messages,
         model=model,
         max_tokens=max_tokens,
+        temperature=0.7,
     )
 
 
@@ -368,14 +579,15 @@ def home():
     <li><code>/why-is-the-sky-blue</code> – answer to a question.</li>
     <li><code>/about</code>, <code>/help</code>, <code>/contact</code> – normal-looking pages.</li>
     <li><code>/api/example</code> – JSON-style API responses.</li>
+    <li><code>/edit/cat</code> – regenerate an existing page with new instructions.</li>
   </ul>
 
   <p>
-    You can also send a <code>POST</code> request with extra data, and the AI will
-    incorporate it into the response.
+    Behind the scenes, pages are remembered and lightly summarized so related URLs
+    can reference each other's knowledge.
   </p>
 
-  <p><strong>TL;DR:</strong> Mess with the path. The AI will improvise.</p>
+  <p><strong>TL;DR:</strong> Mess with the path. The AI will improvise, remember, and let you tweak.</p>
 </body>
 </html>
 """
@@ -388,7 +600,7 @@ def random_page():
     fake_path = "!!GENERATE_RANDOM_TOPIC!!"
 
     mood = flask.request.args.get("mood", "").strip()
-    optional_data = ""  # you could feed query/body later if you want
+    optional_data = ""  # could feed query/body later if you want
 
     response_body = generate_request_body(
         fake_path,
@@ -405,8 +617,107 @@ def random_page():
         content_type += "; charset=utf-8"
     body = rest.strip()
 
-    # DO NOT cache this response
+    # For now, we don't store random topics into memory, since they're one-offs.
     return flask.Response(body, content_type=content_type)
+
+
+@app.route("/edit/<path:url_path>", methods=["GET", "POST"])
+def edit_page(url_path):
+    """
+    Simple 'edit this page' interface.
+    It regenerates the page with extra EDIT_INSTRUCTIONS passed via OPTIONAL_DATA.
+    """
+    display_path = "/" + url_path if not url_path.startswith("/") else url_path
+
+    if flask.request.method == "GET":
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Edit {display_path}</title>
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: auto;
+      padding: 2rem;
+      line-height: 1.6;
+    }}
+    textarea {{
+      width: 100%;
+      height: 200px;
+      font-family: inherit;
+      font-size: 1rem;
+    }}
+    label {{
+      font-weight: bold;
+    }}
+    .actions {{
+      margin-top: 1rem;
+    }}
+    button {{
+      padding: 0.5rem 1rem;
+      font-size: 1rem;
+    }}
+  </style>
+</head>
+<body>
+  <h1>Edit {display_path}</h1>
+  <p>Describe how you want this page changed. The AI will regenerate it from scratch, keeping the URL's topic in mind.</p>
+  <form method="POST">
+    <label for="instructions">Edit instructions:</label><br>
+    <textarea id="instructions" name="instructions" placeholder="e.g. Make it shorter, add a FAQ section, keep it friendly but more formal."></textarea>
+    <div class="actions">
+      <button type="submit">Regenerate Page</button>
+      <a href="{display_path}" style="margin-left: 1rem;">Cancel</a>
+    </div>
+  </form>
+</body>
+</html>
+"""
+        return flask.Response(html, content_type="text/html; charset=utf-8")
+
+    # POST: regenerate with instructions
+    instructions = flask.request.form.get("instructions", "").strip()
+
+    optional_data = f"EDIT_INSTRUCTIONS:\n{instructions or '(no specific instructions)'}\n"
+
+    max_tokens = get_max_tokens_for_path(url_path)
+
+    response_body = generate_request_body(
+        url_path,
+        model=MAIN_MODEL,
+        optional_data=optional_data,
+        mood_instruction="",  # mood can be part of EDIT_INSTRUCTIONS if desired
+        max_tokens=max_tokens,
+    )
+
+    raw_first_line, _, rest = response_body.partition("\n")
+    first_line = raw_first_line.strip()
+
+    # Remove "Content-Type:" prefix if the model added it
+    if first_line.lower().startswith("content-type"):
+        first_line = first_line.split(":", 1)[-1].strip()
+
+    # If it's empty or invalid, default to text/plain
+    if "/" not in first_line:
+        first_line = "text/plain"
+
+    content_type = first_line
+    body = rest.strip()
+
+    # If content_type lacks a charset, force UTF-8
+    if "charset" not in content_type.lower():
+        content_type = f"{content_type}; charset=utf-8"
+
+    # Record new version in memory and update cache
+    normalized_path = "/" + url_path if not url_path.startswith("/") else url_path
+    remember_page(normalized_path, body, content_type)
+
+    cache_key = url_path + "?"
+    cache[cache_key] = (content_type, body)
+
+    return flask.redirect(normalized_path)
 
 
 @app.route('/<path:url_path>', methods=['GET', 'POST'])
@@ -421,9 +732,27 @@ def handle_request(url_path):
 
     mood = flask.request.args.get("mood", "").strip()
 
-    optional_data = ""
+    # Build OPTIONAL_DATA from memory + POST body
+    optional_chunks: list[str] = []
+
+    # 1) Site memory: summaries of related pages
+    normalized_path = "/" + url_path if not url_path.startswith("/") else url_path
+    related = get_related_memory(normalized_path)
+    if related:
+        lines = ["SITE_MEMORY:", "Here are summaries of related pages on this site:"]
+        for path, entry in related:
+            lines.append(f"\n--- {path} ---")
+            summary = entry.get("summary", "")
+            if summary:
+                lines.append(summary[:600])
+        optional_chunks.append("\n".join(lines))
+
+    # 2) POST data (if any)
     if flask.request.method == 'POST':
-        optional_data = f"Additional Data:\n{flask.request.get_data(as_text=True)}\n"
+        post_body = flask.request.get_data(as_text=True)
+        optional_chunks.append(f"POST_DATA:\n{post_body}\n")
+
+    optional_data = "\n\n".join(optional_chunks) if optional_chunks else "(none)"
 
     max_tokens = get_max_tokens_for_path(url_path)
 
@@ -452,6 +781,9 @@ def handle_request(url_path):
     # If content_type lacks a charset, force UTF-8
     if "charset" not in content_type.lower():
         content_type = f"{content_type}; charset=utf-8"
+
+    # Record into memory
+    remember_page(normalized_path, body, content_type)
 
     resp = flask.Response(body, content_type=content_type)
 
