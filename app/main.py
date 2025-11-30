@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, Tuple
@@ -23,6 +24,128 @@ from .memory import clear_page_memory  # NEW
 app = FastAPI()
 cache: Dict[str, Tuple[str, str]] = {}
 image_cache: dict[str, bytes] = {}
+
+async def map_query_to_path(user_input: str) -> str:
+    """
+    Use the main LLM to turn messy natural language into a clean URL path
+    that your catch-all handler will process.
+    """
+
+    raw = user_input.strip()
+
+    # If user already typed a path, just clean it up a bit and trust them.
+    if raw.startswith("/"):
+        path = raw.lower()
+        path = re.sub(r"\s+", "-", path)                 # spaces -> hyphens
+        path = re.sub(r"[^a-z0-9/_\-.]", "", path)       # allowed chars only
+        path = re.sub(r"-+", "-", path).strip()
+        if not path or path == "/":
+            return "/home"
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
+
+    system_prompt = """
+You are a strict URL router for a web app called UniversalAPI.
+
+Your ONLY job is to convert a natural language request into a SINGLE URL PATH STRING.
+
+Rules:
+- Output ONLY the path. No explanations. No quotes. No backticks. No extra text.
+- The path MUST:
+  - Start with "/"
+  - Be all lowercase
+  - Use only: letters a-z, digits 0-9, "/", "-", "_", and "."
+  - Use "-" instead of spaces.
+- Do NOT include a domain, protocol, or query string (no "http://", no "https://", no "?").
+
+- If the user clearly wants an image (asks for a picture, image, icon, logo, drawing, illustration, meme, etc.),
+  then end the path with ".png".
+
+- If the user explicitly mentions a rating tag (G, T, M, A, X) and is asking for a STORY,
+  then use this structure:
+    /story/<rating>/<slug>
+  Example:
+    input: "write a T-rated sci-fi story about space pirates"
+    path:  "/story/t/space-pirates-sci-fi"
+
+- If the user clearly wants a general explanation or info, you can do something like:
+    "/black-holes-explained"
+
+- If the user clearly wants an API-style response, you can do something like:
+    "/api/black-holes"
+
+- If the user clearly wants to edit or refine an existing concept, you MAY use:
+    "/edit/<slug>"
+
+- If the input is completely unclear, default to:
+    "/home"
+
+Examples (for your understanding; do NOT repeat them in the output):
+
+User: "explain black holes like I'm 10"
+Path:  "/black-holes-for-kids"
+
+User: "T-rated fantasy story about a cursed forest"
+Path:  "/story/t/cursed-forest-fantasy"
+
+User: "draw a cute golden retriever wearing sunglasses png"
+Path:  "/golden-retriever-sunglasses.png"
+
+User: "give me a JSON-style summary of quantum computing"
+Path:  "/api/quantum-computing-summary"
+
+User: "edit the cat explanation to be funnier"
+Path:  "/edit/cat"
+
+Remember: respond with ONE path string ONLY.
+"""
+
+    user_prompt = f"User request: {user_input!r}\n\nReturn ONLY the URL path."
+
+    ai_output = await generate_text_response(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        model=MAIN_MODEL,
+        max_tokens=64,
+        temperature=0.2,
+    )
+
+    # Use first non-empty line
+    candidate = ""
+    for line in ai_output.splitlines():
+        line = line.strip()
+        if line:
+            candidate = line
+            break
+
+    if not candidate:
+        return "/home"
+
+    # If the model got too helpful and returned a full URL, strip host
+    candidate = re.sub(r"^https?://[^/]+", "", candidate, flags=re.IGNORECASE)
+
+    # Force leading slash
+    if not candidate.startswith("/"):
+        candidate = "/" + candidate
+
+    # Normalize: lowercase, hyphens, allowed chars only
+    candidate = candidate.lower()
+    candidate = re.sub(r"\s+", "-", candidate)
+    candidate = re.sub(r"[^a-z0-9/_\-.]", "-", candidate)
+    candidate = re.sub(r"-+", "-", candidate).strip()
+    candidate = re.sub(r"^/-+", "/", candidate)
+
+    if not candidate or candidate == "/":
+        candidate = "/home"
+
+    # Clean trailing hyphens and before .png
+    candidate = re.sub(r"-+(\.png)$", r"\1", candidate)
+    candidate = re.sub(r"-+$", "", candidate) or "/home"
+
+    return candidate
 
 
 def safe_delete_file(path: Path) -> None:
@@ -75,6 +198,39 @@ HOME_HTML = """<!DOCTYPE html>
     ul.examples li {
       margin-bottom: 0.4rem;
     }
+    .hero-box {
+      margin: 1.5rem 0;
+      padding: 1rem 1.25rem;
+      border-radius: 8px;
+      background: #f7f9ff;
+      border: 1px solid #dde4ff;
+    }
+    .search-input {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      font-size: 1rem;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    .search-button {
+      margin-top: 0.6rem;
+      padding: 0.5rem 1rem;
+      font-size: 0.95rem;
+      border-radius: 6px;
+      border: none;
+      background: #0645AD;
+      color: white;
+      cursor: pointer;
+    }
+    .search-button:hover {
+      background: #043577;
+    }
+    .hint {
+      font-size: 0.9rem;
+      color: #555;
+      margin-top: 0.4rem;
+    }
   </style>
 </head>
 <body>
@@ -91,8 +247,24 @@ HOME_HTML = """<!DOCTYPE html>
     Every path behaves like its own tiny, auto-generated page, API, or explanation.
   </p>
 
+  <div class="hero-box">
+    <form action="/go" method="get">
+      <label for="q"><strong>Ask for anything:</strong></label><br>
+      <input
+        id="q"
+        name="q"
+        class="search-input"
+        type="text"
+        placeholder="e.g. &quot;explain black holes like I&apos;m 10&quot;, &quot;T-rated sci-fi story about time loops&quot;, &quot;cute golden retriever.png&quot;">
+      <button type="submit" class="search-button">Send to AI</button>
+      <p class="hint">
+        We&apos;ll turn this into a smart URL behind the scenes. Power users can still edit the address bar manually.
+      </p>
+    </form>
+  </div>
+
   <h2>How to Use It</h2>
-  <p>Just change the path in the address bar. For example, try:</p>
+  <p>You can either type in the box above, or mess with the path yourself in the address bar. For example, try:</p>
   <ul class="examples">
     <li><code>/cat</code> – explanation of a concept or thing.</li>
     <li><code>/why-is-the-sky-blue</code> – answer to a question.</li>
@@ -106,15 +278,27 @@ HOME_HTML = """<!DOCTYPE html>
     can reference each other's knowledge.
   </p>
 
-  <p><strong>TL;DR:</strong> Mess with the path. The AI will improvise, remember, and let you tweak.</p>
+  <p><strong>TL;DR:</strong> Type what you want, or mess with the path. The AI will improvise, remember, and let you tweak.</p>
 </body>
 </html>
 """
 
-
 @app.get("/", response_class=HTMLResponse)
 async def home() -> HTMLResponse:
     return HTMLResponse(HOME_HTML)
+
+@app.get("/go")
+async def go(request: Request):
+    """
+    Take natural language ?q=..., turn it into a path via LLM, and redirect there.
+    """
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        # no input? just send them home
+        return RedirectResponse(url="/", status_code=307)
+
+    target_path = await map_query_to_path(q)
+    return RedirectResponse(url=target_path, status_code=307)
 
 
 @app.get("/random")
