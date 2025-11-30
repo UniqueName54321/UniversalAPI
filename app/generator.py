@@ -1,87 +1,94 @@
+# app/generator.py
+import asyncio
+from typing import AsyncIterator, Tuple
 from .prompts import SYSTEM_MESSAGE
-from .ai_client import generate_text_response
-
+from .ai_client import generate_text_response, stream_text_response
 
 def get_max_tokens_for_path(url_path: str) -> int:
-    """
-    Rough heuristic for max_tokens based on the URL path.
-    """
     p = url_path.lower()
-
-    # Tiny text-ish or config-like
     if p in ("robots.txt", "sitemap.xml", "readme.md"):
         return 512
-
-    # API / data paths – usually small structured JSON/XML
     if p.startswith(("api/", "data/", "json/")) or p.endswith((".json", ".xml", ".txt")):
         return 1024
-
-    # Question-style or long-slug explanation
     if "why-" in p or "how-" in p or "-" in p:
         return 2048
-
-    # Default: full HTML-ish page with sections
     return 4096
 
-
-async def generate_page_for_path(
-    url_path: str,
-    model: str,
-    optional_data: str = "",
-    mood_instruction: str = "",
-    max_tokens: int = 2048,
-) -> str:
-    """
-    Build a user-level prompt that works with the cached SYSTEM_MESSAGE
-    and call the model via ai_client.generate_text_response.
-    """
+def _build_messages(url_path: str, optional_data: str, mood_instruction: str):
     mood_instruction = (mood_instruction or "").strip()
-    if mood_instruction:
-        mood_line = f"MOOD_OVERRIDE: {mood_instruction}"
-    else:
-        mood_line = "MOOD_OVERRIDE: (none)"
-
+    mood_line = f"MOOD_OVERRIDE: {mood_instruction}" if mood_instruction else "MOOD_OVERRIDE: (none)"
     user_prompt = (
         f"URL_PATH: {url_path}\n"
         f"{mood_line}\n\n"
         f"OPTIONAL_DATA:\n{optional_data or '(none)'}\n"
     )
+    return [SYSTEM_MESSAGE, {"role": "user", "content": user_prompt}]
 
-    messages = [
-        SYSTEM_MESSAGE,
-        {"role": "user", "content": user_prompt},
-    ]
+async def generate_page_for_path(url_path: str, model: str, optional_data: str = "", mood_instruction: str = "", max_tokens: int = 2048) -> str:
+    messages = _build_messages(url_path, optional_data, mood_instruction)
+    return await generate_text_response(messages, model=model, max_tokens=max_tokens, temperature=0.7)
 
-    return await generate_text_response(
-        messages=messages,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=0.7,
-    )
+def _normalize_mime(first_line: str) -> str:
+    fl = (first_line or "").strip()
+    if fl.lower().startswith("content-type"):
+        fl = fl.split(":", 1)[-1].strip()
+    if "/" not in fl:
+        fl = "text/plain"
+    if "charset" not in fl.lower():
+        fl = f"{fl}; charset=utf-8"
+    return fl
 
-
-def parse_ai_http_response(model_output: str) -> tuple[str, str]:
+async def stream_page_for_path(
+    url_path: str,
+    model: str,
+    optional_data: str = "",
+    mood_instruction: str = "",
+    max_tokens: int = 2048,
+) -> Tuple[str, AsyncIterator[str]]:
     """
-    Parse the model output into (content_type, body).
-    First line: MIME type (or possibly 'Content-Type: ...').
-    Rest: body.
+    Returns (media_type, async iterator of body chunks).
+    The first line of the model stream is parsed as the MIME type.
     """
-    raw_first_line, _, rest = model_output.partition("\n")
-    first_line = raw_first_line.strip()
+    messages = _build_messages(url_path, optional_data, mood_instruction)
+    token_stream = stream_text_response(messages, model=model, max_tokens=max_tokens, temperature=0.7)
 
-    # Remove "Content-Type:" prefix if the model added it
-    if first_line.lower().startswith("content-type"):
-        first_line = first_line.split(":", 1)[-1].strip()
+    # Buffer until we get the first newline to read the MIME
+    mime_holder = {"mime": None}
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    buffer = ""
 
-    # If it's empty or invalid, default to text/plain
-    if ("/" not in first_line) or not first_line:
-        first_line = "text/plain"
+    async def producer():
+        nonlocal buffer
+        async for chunk in token_stream:
+            if mime_holder["mime"] is None:
+                buffer += chunk
+                if "\n" in buffer:
+                    first_line, rest = buffer.split("\n", 1)
+                    mime_holder["mime"] = _normalize_mime(first_line)
+                    if rest:
+                        await queue.put(rest)
+            else:
+                await queue.put(chunk)
+        # If stream ended and we never saw a newline, treat whole buffer as body
+        if mime_holder["mime"] is None:
+            mime_holder["mime"] = _normalize_mime("")
+            if buffer:
+                await queue.put(buffer)
+        await queue.put(None)
 
-    content_type = first_line
-    body = rest.strip()
+    async def body_iter():
+        # Emit everything placed in the queue by producer
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
 
-    # If content_type lacks a charset, force UTF-8
-    if "charset" not in content_type.lower():
-        content_type = f"{content_type}; charset=utf-8"
+    # Start producer task
+    asyncio.create_task(producer())
 
-    return content_type, body
+    # Wait until MIME discovered
+    while mime_holder["mime"] is None:
+        await asyncio.sleep(0)
+
+    return mime_holder["mime"], body_iter()

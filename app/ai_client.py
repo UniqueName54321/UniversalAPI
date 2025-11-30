@@ -1,80 +1,56 @@
+# app/ai_client.py
 import asyncio
-import openai
+from openai import AsyncOpenAI
 
 or_api_key = ""
 with open(".openrouter_api_key", "r") as f:
     or_api_key = f.read().strip()
 
-client = openai.OpenAI(
+client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=or_api_key,
 )
 
-
 def _preview(text: str, limit: int = 400) -> str:
-    """Return a shortened one-line preview of text for logging."""
     text = text.replace("\n", "\\n")
-    if len(text) > limit:
-        return text[:limit] + "... [truncated]"
-    return text
+    return text[:limit] + ("... [truncated]" if len(text) > limit else "")
 
+async def generate_text_response(messages: list[dict], model: str, max_tokens: int = 2048, temperature: float = 0.7) -> str:
+    print("\n[AI] ----- non-stream call -----")
+    print(f"[AI] model={model} max_tokens={max_tokens} temp={temperature}")
+    print(f"[AI] prompt preview: {_preview(next((m['content'] for m in messages if m['role']=='user'),''))}")
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    msg = resp.choices[0].message.content or ""
+    print(f"[AI] completion len={len(msg)}")
+    return msg
 
-async def generate_text_response(
-    messages: list[dict],
-    model: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-) -> str:
+async def stream_text_response(messages: list[dict], model: str, max_tokens: int = 2048, temperature: float = 0.7):
     """
-    Async wrapper around the synchronous OpenRouter client.
-    Uses a threadpool so it plays nice with FastAPI's event loop.
+    Async generator that yields content tokens (strings).
     """
+    print("\n[AI] ----- stream call -----")
+    print(f"[AI] model={model} max_tokens={max_tokens} temp={temperature}")
+    print(f"[AI] prompt preview: {_preview(next((m['content'] for m in messages if m['role']=='user'),''))}")
 
-    # --- pre-call debug info ---
-    print("\n[AI] --------------------------------------------------")
-    print(f"[AI] Calling model: {model}")
-    print(f"[AI] max_tokens: {max_tokens}, temperature: {temperature}")
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stream=True,
+    )
 
-    user_contents = [m.get("content", "") for m in messages if m.get("role") == "user"]
-    last_user_content = user_contents[-1] if user_contents else ""
-    print(f"[AI] Prompt preview (last user message):\n[AI]   { _preview(last_user_content) }")
-    print("[AI] Sending request to OpenRouter...")
-
-    loop = asyncio.get_event_loop()
-
-    def _call_sync():
+    async for event in stream:
+        # OpenAI-compatible streaming events: look for delta.content
         try:
-            return client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-        except Exception as e:
-            print(f"[AI] ERROR while calling model {model}: {e}")
-            raise
-
-    response = await loop.run_in_executor(None, _call_sync)
-
-    message = response.choices[0].message.content or ""
-    resp_preview = _preview(message)
-
-    # --- post-call debug info ---
-    print("[AI] Received response from model.")
-    print(f"[AI] Response preview:\n[AI]   {resp_preview}")
-    print(f"[AI] Response length: {len(message)} characters")
-
-    usage = getattr(response, "usage", None)
-    if usage:
-        try:
-            print(
-                f"[AI] Token usage - prompt: {usage.prompt_tokens}, "
-                f"completion: {usage.completion_tokens}, "
-                f"total: {usage.total_tokens}"
-            )
+            delta = event.choices[0].delta
+            if delta and (tok := (delta.content or "")):
+                yield tok
         except Exception:
-            print(f"[AI] Raw usage object: {usage}")
-
-    print("[AI] --------------------------------------------------\n")
-
-    return message
+            # ignore non-token events (e.g., role, tool, etc.)
+            continue

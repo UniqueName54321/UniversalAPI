@@ -1,15 +1,13 @@
+import asyncio
 from typing import Dict, Tuple
-
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, Response, RedirectResponse, StreamingResponse
 
 from .config import MAIN_MODEL, RANDOM_MODEL
-from .generator import generate_page_for_path, get_max_tokens_for_path, parse_ai_http_response
+from .generator import generate_page_for_path, get_max_tokens_for_path, stream_page_for_path
 from .memory import remember_page, get_related_memory
 
 app = FastAPI()
-
-# Simple in-memory cache: key -> (content_type, body)
 cache: Dict[str, Tuple[str, str]] = {}
 
 
@@ -91,22 +89,22 @@ async def home() -> HTMLResponse:
 @app.get("/random")
 async def random_page(mood: str | None = None):
     """
-    Generate a random fictional topic page using a fake path.
+    Stream a random fictional topic page.
     """
-    fake_path = "!!GENERATE_RANDOM_TOPIC!!"
-
-    response_body = await generate_page_for_path(
-        url_path=fake_path,
+    media_type, body_stream = await stream_page_for_path(
+        url_path="!!GENERATE_RANDOM_TOPIC!!",
         model=RANDOM_MODEL,
         optional_data="",
         mood_instruction=mood or "",
         max_tokens=3072,
     )
 
-    content_type, body = parse_ai_http_response(response_body)
-    # Random topics are not stored in memory (like your original code)
-    return Response(content=body, media_type=content_type)
+    # No memory for /random per your original rule
+    async def passthrough():
+        async for chunk in body_stream:
+            yield chunk
 
+    return StreamingResponse(passthrough(), media_type=media_type)
 
 @app.get("/edit/{url_path:path}", response_class=HTMLResponse)
 async def edit_page_get(url_path: str) -> HTMLResponse:
@@ -164,60 +162,59 @@ async def edit_page_get(url_path: str) -> HTMLResponse:
 
 
 @app.post("/edit/{url_path:path}")
-async def edit_page_post(
-    url_path: str,
-    instructions: str = Form(""),
-):
+async def edit_page_post(url_path: str, instructions: str = Form("")):
     """
-    Regenerate the page with edit instructions, then redirect to the updated page.
+    Regenerate content, then redirect. (Non-stream is fine here since we redirect.)
+    We DEFER summarization.
     """
     optional_data = f"EDIT_INSTRUCTIONS:\n{instructions or '(no specific instructions)'}\n"
-
     max_tokens = get_max_tokens_for_path(url_path)
 
     response_body = await generate_page_for_path(
         url_path=url_path,
         model=MAIN_MODEL,
         optional_data=optional_data,
-        mood_instruction="",  # mood can be part of EDIT_INSTRUCTIONS if desired
+        mood_instruction="",
         max_tokens=max_tokens,
     )
 
-    content_type, body = parse_ai_http_response(response_body)
+    # Parse first line for media type, then body
+    raw_first, _, rest = response_body.partition("\n")
+    media_type = raw_first.strip()
+    if media_type.lower().startswith("content-type"):
+        media_type = media_type.split(":", 1)[-1].strip()
+    if "/" not in media_type:
+        media_type = "text/plain"
+    if "charset" not in media_type.lower():
+        media_type = f"{media_type}; charset=utf-8"
+    full_body = rest.strip()
 
-    # Record new version in memory and update cache
     normalized_path = "/" + url_path if not url_path.startswith("/") else url_path
-    await remember_page(normalized_path, body, content_type)
-
     cache_key = url_path + "?"
-    cache[cache_key] = (content_type, body)
+
+    # Cache now
+    cache[cache_key] = (media_type, full_body)
+
+    # Defer memory work (summarization + links)
+    asyncio.create_task(remember_page(normalized_path, full_body, media_type))
 
     return RedirectResponse(url=normalized_path, status_code=302)
 
 
 @app.api_route("/{url_path:path}", methods=["GET", "POST"])
-async def handle_request(
-    url_path: str,
-    request: Request,
-    mood: str | None = None,
-):
-    """
-    Main catch-all route that delegates to the LLM based on URL path.
-    Supports GET + POST, cache, and site memory.
-    """
+async def handle_request(url_path: str, request: Request, mood: str | None = None):
     query = request.url.query or ""
     cache_key = f"{url_path}?{query}"
 
-    # Serve from cache for GETs
+    # ----- CACHE HIT -----
     if request.method == "GET" and cache_key in cache:
         content_type, body = cache[cache_key]
         return Response(content=body, media_type=content_type)
 
-    # Build OPTIONAL_DATA from memory + POST body
+    # ----- OPTIONAL DATA BUILD -----
     optional_chunks: list[str] = []
-
-    # 1) Site memory: summaries of related pages
     normalized_path = "/" + url_path if not url_path.startswith("/") else url_path
+
     related = get_related_memory(normalized_path)
     if related:
         lines = ["SITE_MEMORY:", "Here are summaries of related pages on this site:"]
@@ -228,17 +225,16 @@ async def handle_request(
                 lines.append(summary[:600])
         optional_chunks.append("\n".join(lines))
 
-    # 2) POST data (if any)
     if request.method == "POST":
-        post_body_bytes = await request.body()
-        post_body = post_body_bytes.decode("utf-8", "ignore")
+        post_body = (await request.body()).decode("utf-8", "ignore")
         optional_chunks.append(f"POST_DATA:\n{post_body}\n")
 
     optional_data = "\n\n".join(optional_chunks) if optional_chunks else "(none)"
 
     max_tokens = get_max_tokens_for_path(url_path)
 
-    response_body = await generate_page_for_path(
+    # ----- STREAM FROM MODEL -----
+    media_type, body_stream = await stream_page_for_path(
         url_path=url_path,
         model=MAIN_MODEL,
         optional_data=optional_data,
@@ -246,19 +242,40 @@ async def handle_request(
         max_tokens=max_tokens,
     )
 
-    content_type, body = parse_ai_http_response(response_body)
+    # ----- RULE: DO NOT STREAM JSON OR XML -----
+    if media_type.startswith("application/json") or media_type.endswith("json") \
+       or media_type.endswith("xml") or media_type.startswith("text/xml") \
+       or "xml" in media_type:
 
-    # Record into memory
-    await remember_page(normalized_path, body, content_type)
+        # Fully consume the stream
+        parts = []
+        async for chunk in body_stream:
+            parts.append(chunk)
+        full_body = "".join(parts)
 
-    resp = Response(content=body, media_type=content_type)
+        # async memory save
+        asyncio.create_task(remember_page(normalized_path, full_body, media_type))
 
-    # Cache GET responses
-    if request.method == "GET":
-        cache[cache_key] = (content_type, body)
+        if request.method == "GET":
+            cache[cache_key] = (media_type, full_body)
 
-    return resp
+        return Response(full_body, media_type=media_type)
 
+    # ----- OTHERWISE: STREAM LIKE A GIGACHAD -----
+    async def tee():
+        parts: list[str] = []
+        async for chunk in body_stream:
+            parts.append(chunk)
+            yield chunk
+
+        full_body = "".join(parts)
+
+        asyncio.create_task(remember_page(normalized_path, full_body, media_type))
+
+        if request.method == "GET":
+            cache[cache_key] = (media_type, full_body)
+
+    return StreamingResponse(tee(), media_type=media_type)
 
 if __name__ == "__main__":
     import uvicorn

@@ -183,3 +183,7 @@ cython_debug/
 # OpenRouter API key file
 # yeah no i'm not leaking my api key :P
 .openrouter_api_key
+
+# Page memory file
+# Not useful to track page memory in git, and might leak sensitive info anyway so uhh :3
+page_memory.json
