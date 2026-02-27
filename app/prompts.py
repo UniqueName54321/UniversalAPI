@@ -1,4 +1,7 @@
-from .config import RANDOM_MODEL, MAIN_MODEL  # kept here for convenience, if needed elsewhere
+from .config import (
+    RANDOM_MODEL,
+    MAIN_MODEL,
+)  # kept here for convenience, if needed elsewhere
 
 AI_PERSONALITY = """
 You are friendly, helpful, a little humorous, and you keep explanations simple.
@@ -109,8 +112,12 @@ Inside <body>:
 - Always include a top navigation bar with links to:
   "/", "/about", "/help", "/contact", "/topics", "/random", "/api"
 
+- Write naturally engaging content that includes 2-4 relevant internal links within the body text, not just in sidebar sections. Use descriptive anchor text like "learn more about [topic]", "see our guide to [related topic]", or "check out [other page]".
+
 - Include a small "Edit this page" link (e.g. near top or bottom):
   <a href="/edit{{URL_PATH}}" class="edit-link">Edit this page</a>
+
+- Naturally incorporate 2-4 relevant internal links within the content itself (in the body text, not just in sidebar sections). Use anchor text like "learn more about [topic]", "see our guide to [related topic]", or "check out [other page]".
 
 - Add a "Related Pages" section (3–6 internal links that fit the topic).
 
