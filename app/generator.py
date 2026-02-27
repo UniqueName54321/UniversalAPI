@@ -8,6 +8,7 @@ from .config import RANDOM_MODEL, IMAGE_GEN_MODEL
 from .prompts import IMAGE_PROMPT_SYSTEM, SYSTEM_MESSAGE
 from .ai_client import generate_image, generate_text_response, stream_text_response
 
+
 def get_max_tokens_for_path(url_path: str) -> int:
     p = url_path.lower().strip()
 
@@ -19,21 +20,27 @@ def get_max_tokens_for_path(url_path: str) -> int:
     if p in ("robots.txt", "sitemap.xml", "readme.md"):
         return 512
 
-    # API / data paths – usually small structured JSON/XML
-    if p.startswith(("api/", "data/", "json/")) or p.endswith((".json", ".xml", ".txt")):
-        return 1024
+    # API / data paths – usually structured JSON/XML, but not artificially capped
+    if p.startswith(("api/", "data/", "json/")) or p.endswith(
+        (".json", ".xml", ".txt")
+    ):
+        return 8192  # Much larger for proper API responses
 
     # Question-style or long-slug explanation
     if "why-" in p or "how-" in p or "-" in p:
-        return 2048
+        return 8192  # Larger for comprehensive explanations
 
     # Default: full HTML-ish page with sections
-    return 4096
+    return 16384  # Much larger for comprehensive pages
 
 
 def _build_messages(url_path: str, optional_data: str, mood_instruction: str):
     mood_instruction = (mood_instruction or "").strip()
-    mood_line = f"MOOD_OVERRIDE: {mood_instruction}" if mood_instruction else "MOOD_OVERRIDE: (none)"
+    mood_line = (
+        f"MOOD_OVERRIDE: {mood_instruction}"
+        if mood_instruction
+        else "MOOD_OVERRIDE: (none)"
+    )
     user_prompt = (
         f"URL_PATH: {url_path}\n"
         f"{mood_line}\n\n"
@@ -41,9 +48,19 @@ def _build_messages(url_path: str, optional_data: str, mood_instruction: str):
     )
     return [SYSTEM_MESSAGE, {"role": "user", "content": user_prompt}]
 
-async def generate_page_for_path(url_path: str, model: str, optional_data: str = "", mood_instruction: str = "", max_tokens: int = 2048) -> str:
+
+async def generate_page_for_path(
+    url_path: str,
+    model: str,
+    optional_data: str = "",
+    mood_instruction: str = "",
+    max_tokens: int = 2048,
+) -> str:
     messages = _build_messages(url_path, optional_data, mood_instruction)
-    return await generate_text_response(messages, model=model, max_tokens=max_tokens, temperature=0.7)
+    return await generate_text_response(
+        messages, model=model, max_tokens=max_tokens, temperature=0.7
+    )
+
 
 def _normalize_mime(mime: str) -> str:
     """
@@ -102,7 +119,6 @@ def parse_status_and_mime(first_line: str) -> tuple[int, str]:
 
     mime = _normalize_mime(mime_part)
     return status, mime
-
 
 
 async def stream_page_for_path(
@@ -166,6 +182,7 @@ async def stream_page_for_path(
 
     return status_holder["status"], mime_holder["mime"], body_iter()
 
+
 def _path_to_image_concept(url_path: str) -> str:
     """
     Convert something like '/stories/space-wizard.png' -> 'space wizard'
@@ -221,7 +238,7 @@ async def generate_png_for_path(
         # log error somewhere if you want
         print(f"[IMAGE] Error generating PNG for {url_path}: {e}")
         return b"", 500
-    
+
 
 async def build_image_prompt_for_path(
     url_path: str,
@@ -236,9 +253,7 @@ async def build_image_prompt_for_path(
     mood_line = mood_instruction.strip() if mood_instruction else "(none)"
 
     user_content = (
-        f"URL_PATH: {url_path}\n"
-        f"MOOD: {mood_line}\n\n"
-        f"SITE_CONTEXT:\n{optional_data}"
+        f"URL_PATH: {url_path}\nMOOD: {mood_line}\n\nSITE_CONTEXT:\n{optional_data}"
     )
 
     messages = [
@@ -269,7 +284,6 @@ async def generate_png_for_path(
     """
 
     print("[DEBUG] Using IMAGE_GEN_MODEL:", IMAGE_GEN_MODEL)
-
 
     try:
         image_prompt = await build_image_prompt_for_path(
