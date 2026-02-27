@@ -7,7 +7,7 @@ This module handles core content generation functionality including:
 - Main catch-all route for dynamic content generation
 """
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from typing import AsyncIterator
 
@@ -24,6 +24,99 @@ from ..config import IMAGE_CACHE_DIR_STR, RANDOM_MODEL
 import os
 import asyncio
 
+
+ERROR_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Oops! Something went wrong - Universal AI Router</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: auto;
+      padding: 2rem;
+      line-height: 1.6;
+      background-color: #fff5f5;
+    }
+    .error-container {
+      background: white;
+      border-radius: 8px;
+      padding: 2rem;
+      border: 1px solid #fed7d7;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .error-title {
+      color: #e53e3e;
+      font-size: 2rem;
+      margin-bottom: 1rem;
+    }
+    .error-details {
+      background: #f7fafc;
+      padding: 1rem;
+      border-radius: 4px;
+      margin: 1rem 0;
+      border-left: 4px solid #e53e3e;
+    }
+    .error-code {
+      font-family: monospace;
+      background: #2d3748;
+      color: #e2e8f0;
+      padding: 0.5rem;
+      border-radius: 4px;
+      margin: 0.5rem 0;
+      overflow-x: auto;
+    }
+    .back-button {
+      background: #4299e1;
+      color: white;
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1rem;
+      text-decoration: none;
+      display: inline-block;
+      margin-top: 1rem;
+    }
+    .back-button:hover {
+      background: #3182ce;
+    }
+    .hint {
+      font-size: 0.9rem;
+      color: #718096;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="error-container">
+    <h1 class="error-title">Oops! Something went wrong.</h1>
+    <p>The AI content generation encountered an error. Don't worry, this happens sometimes!</p>
+    
+    <div class="error-details">
+      <h3>What happened:</h3>
+      <p>The AI service returned an error while trying to generate content for this page.</p>
+      
+      <h3>What you can do:</h3>
+      <ul>
+        <li>Go back and try again - it's usually a temporary issue</li>
+        <li>Try a different path or query</li>
+        <li>Check if the AI service is experiencing issues</li>
+      </ul>
+      
+      <div class="error-code">{{error_code}}</div>
+      
+      <p class="hint">
+        If the problem persists, please try again later or contact the administrator.
+      </p>
+    </div>
+    
+    <a href="/" class="back-button">← Go to Home</a>
+  </div>
+</body>
+</html>
+"""
 
 HOME_HTML = """<!DOCTYPE html>
 <html>
@@ -256,13 +349,18 @@ def register_routes(app: FastAPI) -> None:
         max_tokens = get_max_tokens_for_path(url_path)
 
         # ----- STREAM FROM MODEL -----
-        status_code, media_type, body_stream = await stream_page_for_path(
-            url_path=url_path,
-            model="openrouter/auto",  # MAIN_MODEL
-            optional_data=optional_data,
-            mood_instruction=(mood or "").strip(),
-            max_tokens=max_tokens,
-        )
+        try:
+            status_code, media_type, body_stream = await stream_page_for_path(
+                url_path=url_path,
+                model="openrouter/auto",  # MAIN_MODEL
+                optional_data=optional_data,
+                mood_instruction=(mood or "").strip(),
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            error_msg = f"AI Generation Error: {str(e)}"
+            error_page = ERROR_HTML.replace("{{error_code}}", error_msg)
+            return HTMLResponse(content=error_page, status_code=500)
 
         # ----- RULE: DO NOT STREAM JSON OR XML -----
         if (
@@ -285,17 +383,29 @@ def register_routes(app: FastAPI) -> None:
             return Response(full_body, media_type=media_type, status_code=status_code)
 
         # ----- OTHERWISE: STREAM LIKE A GIGACHAD -----
-        async def tee():
-            parts: list[str] = []
+        # Buffer the entire response first for reliable caching
+        parts = []
+        try:
             async for chunk in body_stream:
                 parts.append(chunk)
-                yield chunk
+        except Exception as e:
+            error_msg = f"Streaming Error: {str(e)}"
+            error_page = ERROR_HTML.replace("{{error_code}}", error_msg)
+            return HTMLResponse(content=error_page, status_code=500)
 
-            full_body = "".join(parts)
+        full_body = "".join(parts)
 
+        # Cache and remember synchronously to ensure completion
+        if request.method == "GET":
+            set_cache_entry(cache_key, (media_type, full_body))
+
+        # Create task for memory (don't await to prevent blocking)
+        try:
             asyncio.create_task(remember_page(normalized_path, full_body, media_type))
+        except Exception:
+            pass  # Don't fail the response if memory storage fails
 
-            if request.method == "GET":
-                set_cache_entry(cache_key, (media_type, full_body))
-
-        return StreamingResponse(tee(), media_type=media_type, status_code=status_code)
+        # Return the buffered response
+        return Response(
+            content=full_body, media_type=media_type, status_code=status_code
+        )
